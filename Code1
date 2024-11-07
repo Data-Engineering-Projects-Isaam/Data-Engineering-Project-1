@@ -1,0 +1,76 @@
+import sys
+import boto3
+import json
+from pyspark.context import SparkContext
+from awsglue.context import GlueContext
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+from pyspark.sql.types import StructType, StructField, StringType, MapType
+
+# Initialize Glue context
+args = getResolvedOptions(sys.argv, ['JOB_NAME'])
+sc = SparkContext()
+glueContext = GlueContext(sc)
+spark = glueContext.spark_session
+
+# Create a CloudTrail client
+cloudtrail = boto3.client('cloudtrail')
+
+# Fetch CloudTrail events
+response = cloudtrail.lookup_events(MaxResults=50)  # Adjust MaxResults as needed
+
+# Extract and flatten the JSON data for table access events
+flattened_events = []
+
+for event in response['Events']:
+    event_detail = json.loads(event['CloudTrailEvent'])
+   
+    # Check if the event relates to table access (e.g., Athena, Redshift, etc.)
+    if event['EventSource'] in ['athena.amazonaws.com', 'redshift.amazonaws.com']:
+        # Extract relevant details based on event type
+        user_identity = event.get('UserIdentity', {}).get('UserName', 'Unknown')
+        database_name = None
+        table_name = None
+       
+        # Assuming we are interested in Athena or Redshift
+        if event['EventName'] in ['StartQueryExecution', 'ExecuteStatement']:  # Example events
+            if 'QueryExecution' in event_detail:
+                query = event_detail['QueryExecution']['Query']
+                # Here you might want to parse the query to extract database and table names
+                # Simplistic parsing; you may need a more robust SQL parser based on your use case
+                if 'FROM' in query:
+                    from_clause = query.split('FROM')[1].strip().split()[0]
+                    database_name, table_name = from_clause.split('.')
+                   
+        flattened_event = {
+            'EventId': event['EventId'],
+            'EventName': event['EventName'],
+            'EventTime': event['EventTime'],
+            'EventSource': event['EventSource'],
+            'UserName': user_identity,
+            'DatabaseName': database_name,
+            'TableName': table_name,
+        }
+        flattened_events.append(flattened_event)
+
+# Create a DataFrame from the flattened data
+schema = StructType([
+    StructField('EventId', StringType(), True),
+    StructField('EventName', StringType(), True),
+    StructField('EventTime', StringType(), True),
+    StructField('EventSource', StringType(), True),
+    StructField('UserName', StringType(), True),
+    StructField('DatabaseName', StringType(), True),
+    StructField('TableName', StringType(), True),
+])
+
+df = spark.createDataFrame(flattened_events, schema)
+
+# Define S3 path to write Parquet file
+output_s3_path = 's3://mybucket/cloudtrail-data/table-access/'
+
+# Write DataFrame to S3 in Parquet format
+df.write.mode('overwrite').parquet(output_s3_path)
+
+# Commit job
+job.commit()
